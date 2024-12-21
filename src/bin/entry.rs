@@ -108,7 +108,7 @@ async fn main(spawner: Spawner) -> ! {
     let usb_fut = usb.run();
 
     // Currently reports the letter "a" every 500ms
-    let hid_fut = async {
+    /*let hid_fut = async {
         loop {
             Timer::after_millis(500).await;
 
@@ -124,10 +124,7 @@ async fn main(spawner: Spawner) -> ! {
                 Err(e) => warn!("Failed to send report: {:?}", e),
             }
         }
-    };
-
-    // STOPS AFTER THIS! (FOR NOW)
-    join(usb_fut, hid_fut).await;
+    };*/
 
     // Internally pull-down the Input ports
     let mut row1 = Input::new(p.PB7, Pull::Down);
@@ -195,8 +192,6 @@ async fn main(spawner: Spawner) -> ! {
                     if keycode < 0xE0 && keycode != 0 {
                         keycodes[i] = keycode as u8;
                     // Standard Modifier keys
-                    // a la
-                    // https://docs.zephyrproject.org/apidoc/latest/group__usb__hid__mk__report__desc.html
                     } else if keycode >= 0xE0 {
                        match keycode {
                            0xE0 => modifier |= 0x01, // left ctrl
@@ -217,27 +212,33 @@ async fn main(spawner: Spawner) -> ! {
                 }
             }
 
-            for i in 0..keycodes.len() {
-                
+            // Ensure each keycode gets its time in the spotlight (aka gets a report)
+            // Individual reports are required due to the layer system and non-standard format.
+            for keycode in keycodes {
+                let (mut new_modifier, code) = keycode_mapping(modifier, keycode); 
+
+                // HID doesn't care about layers and all that, so remove before u8 cast 
+                new_modifier &= 0b11111111;
+
+                // Generate a report with the given keycodes
+                let report = KeyboardReport {
+                    modifier: new_modifier as u8,
+                    reserved: 0,
+                    leds: 0,
+                    keycodes: [code, 0, 0, 0, 0, 0], 
+                };
+
+                // Sends report to computer about the keys being pressed
+                match writer.write_serialize(&report).await {
+                    Ok(()) => {}
+                    Err(e) => warn!("Failed to send report: {:?}", e),
+                } 
             }
 
-            // Generate a report with the given keycodes
-            let report = KeyboardReport {
-                modifier,
-                reserved: 0,
-                leds: 0,
-                keycodes 
-            };
-
-            // Sends report to computer about the keys being pressed
-            match writer.write_serialize(&report).await {
-                Ok(()) => {}
-                Err(e) => warn!("Failed to send report: {:?}", e),
-            } 
         }
     };
 
-    
+    join(usb_fut, main_fut).await;
 
     loop {
         info!("WARNING! Impossible point reached implying system failure");
@@ -286,25 +287,49 @@ async fn scan_matrix(key_matrix: &mut KeyMatrix) -> Vec::<u16, 6> {
 // Prepare for some disgusting HID stuff. This is the primary keymapping system that takes actual
 // HID codes and remaps them into my custom keymapping. I'm including support for my other
 // alternative keys (like Meta and Hyper) alongside the currently implemented shift and layer keys.
-fn keycode_mapping(original_modifier: u8, keycode: u8) -> (u8, u8) {
+fn keycode_mapping(original_modifier: u16, keycode: u8) -> (u16, u8) {
     // Unmodified
     if(original_modifier == 0x000) {
         match keycode {
-            0x2F => return (original_modifier | 0x02, 0x2F),
+            0x2F => return (original_modifier &0b11011111, 0x2F), // Default { instead of [
             _ => return (original_modifier, keycode),
         }
     }
     
     // Layer handler
-    if(original_modifier & 0x100 == 0x100) {
-
+    if(original_modifier & 0b100000000 == 0b100000000) {
+        // Check if shift is being held with layer
+        if(original_modifier & 0b0000010 == 0x02 || original_modifier & 0b00100000 == 0x020) {
+            match keycode {
+                0x29 => return (original_modifier, 0x35), // Shift+Layer+Esc = ~
+                0x2E => return (original_modifier, 0x2D), // Layer+= = -
+                0x2F => return (original_modifier &0b11011101, 0x30), // Shift+Layer+{ = ]
+                0x33 => return (original_modifier, 0x34), // Shift+Layer+; = "
+                0x36 => return (original_modifier, 0x37), // Shift+Layer+, = >
+                0x38 => return (original_modifier, 0x31), // Shift+Layer+/ = |
+                _ => return (original_modifier, keycode)
+            }
+        } else { // Shift isn't being held
+            match keycode {
+                0x29 => return (original_modifier, 0x35), // Layer+Esc = `
+                0x2E => return (original_modifier, 0x2D), // Layer+= = -
+                0x2F => return (original_modifier |0b00100010, 0x30), // Layer+{ = }
+                0x0B => return (original_modifier, 0x50), // Layer+h = left key 
+                0x0D => return (original_modifier, 0x51), // Layer+j = down key
+                0x0E => return (original_modifier, 0x52), // Layer+k = up key
+                0x0F => return (original_modifier, 0x4F), // Layer+l = right key
+                0x33 => return (original_modifier, 0x34), // Layer+; = '
+                0x36 => return (original_modifier, 0x37), // Layer+, = .
+                0x38 => return (original_modifier, 0x31), // Layer+/ = \
+                _ => return (original_modifier, keycode)
+            }
+        }
     }
 
-
     // Shift Key handler
-    if(original_modifier & 0x01 == 0x02 || original_modifier & 0x010 == 0x020) {
-        match keycode {
-                    // 
+    if(original_modifier & 0b0000010 == 0x02 || original_modifier & 0b00100000 == 0x020) {
+        match keycode { 
+            0x2F => return (original_modifier &0b11011101, 0x2F), // Shift+{ = [
             _ => return (original_modifier, keycode)
         }
     }
