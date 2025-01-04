@@ -24,6 +24,8 @@ use hal::gpio::{Level, Output, Input, Pull};
 use qingke::riscv;
 use {ch32_hal as hal, panic_halt as _};
 
+static DEBOUNCE_TIME: i32 = 20; // 20ms
+
 // helpful references:
 // https://wiki.osdev.org/USB_Human_Interface_Devices#USB_keyboard
 
@@ -68,7 +70,7 @@ async fn main(spawner: Spawner) -> ! {
     config.product = Some("Burnboard");
     config.serial_number = Some("0000_0001");
     config.self_powered = true;
-    config.max_power = 350; //mA
+    config.max_power = 400; //mA
     config.max_packet_size_0 = 16;
 
     // Window compat
@@ -110,7 +112,7 @@ async fn main(spawner: Spawner) -> ! {
     // Currently reports the letter "a" every 500ms
     /*let hid_fut = async {
         loop {
-            Timer::after_millis(500).await;
+            Timer::after_millis(1000).await;
 
             let mut report = KeyboardReport::default();
 
@@ -124,7 +126,11 @@ async fn main(spawner: Spawner) -> ! {
                 Err(e) => warn!("Failed to send report: {:?}", e),
             }
         }
-    };*/
+    };
+    
+    join(usb_fut, main_fut).await;
+
+    */
 
     // Internally pull-down the Input ports
     let mut row1 = Input::new(p.PB7, Pull::Down);
@@ -179,7 +185,7 @@ async fn main(spawner: Spawner) -> ! {
     let main_fut = async {
         loop {
             // Scans the key matrix
-            let mut scan_data = scan_matrix(&mut matrix).await;
+            let scan_data = scan_matrix(&mut matrix).await;
            
             // HID modifier and keycode array
             let mut modifier: u16 = 0x0000;
@@ -188,10 +194,10 @@ async fn main(spawner: Spawner) -> ! {
             // scan_data length is guaranteed to be smaller than or equal to keycodes length
             for i in 0..scan_data.len() {
                 if let Some(&keycode) = scan_data.get(i) {
-                    // Standard keys
+                    // Standard typing keys
                     if keycode < 0xE0 && keycode != 0 {
                         keycodes[i] = keycode as u8;
-                    // Standard Modifier keys
+                    // Modifier keys
                     } else if keycode >= 0xE0 {
                        match keycode {
                            0xE0 => modifier |= 0x01, // left ctrl
@@ -206,86 +212,105 @@ async fn main(spawner: Spawner) -> ! {
                            0x200 => modifier |= 0x200, // function
                            0x400 => modifier |= 0x400, // meta
                            0x800 => modifier |= 0x800, // hyper
-                           _ => info!("WARNING - Impossible modifier keycode"),
+                           _ => info!("WARNING - Unhandled modifier keycode"),
                        } 
                     }
                 }
             }
-
+            
             // Ensure each keycode gets its time in the spotlight (aka gets a report)
             // Individual reports are required due to the layer system and non-standard format.
-            for keycode in keycodes {
-                let (mut new_modifier, code) = keycode_mapping(modifier, keycode); 
+            if keycodes.first() != Some(&0x01) {
+                for keycode in keycodes {
+                    let (mut new_modifier, code) = keycode_mapping(modifier, keycode); 
 
-                // HID doesn't care about layers and all that, so remove before u8 cast 
-                new_modifier &= 0b11111111;
+                    // HID doesn't care about layers and all that, so remove before report u8 cast 
+                    new_modifier &= 0b11111111;
 
-                // Generate a report with the given keycodes
+                    // Generate a report with the given keycodes
+                    let report = KeyboardReport {
+                        modifier: new_modifier as u8,
+                        reserved: 0,
+                        leds: 0,
+                        keycodes: [code, 0, 0, 0, 0, 0], 
+                    };
+
+                    // Sends report to computer about the keys being pressed
+                    match writer.write_serialize(&report).await {
+                        Ok(()) => {}
+                        Err(e) => warn!("Failed to send report: {:?}", e),
+                    } 
+                }
+            // Phantom keycode detected, generate phantom report
+            } else {
                 let report = KeyboardReport {
-                    modifier: new_modifier as u8,
+                    modifier: (modifier & 0b11111111) as u8,
                     reserved: 0,
                     leds: 0,
-                    keycodes: [code, 0, 0, 0, 0, 0], 
+                    keycodes: [0x01, 0x01, 0x01, 0x01, 0x01, 0x01],
                 };
 
-                // Sends report to computer about the keys being pressed
                 match writer.write_serialize(&report).await {
                     Ok(()) => {}
-                    Err(e) => warn!("Failed to send report: {:?}", e),
-                } 
+                    Err(e) => warn!("Failed to send phantom report: {:?}", e),
+                }
             }
-
-        }
-    };
+        } //async loop
+    }; //let main_fut
 
     join(usb_fut, main_fut).await;
 
     loop {
+        Timer::after_secs(1).await;
         info!("WARNING! Impossible point reached implying system failure");
     }
 }
 
 async fn scan_matrix(key_matrix: &mut KeyMatrix) -> Vec::<u16, 6> {
     
-    // Allocate 6 keys to be pressed
+    // Allocate 6 possible keys that can be pressed
     let mut keys_pressed = Vec::<u16, 6>::new();
 
     // Clean the list of keys pressed
     keys_pressed.clear();
 
-    // First, scan the key matrix 
-    // TODO: Add debouncing, investigate interrupt-based system
+    // Scan the key matrix 
+    // TODO: Auto-repeat, investigate advanced debounce and interrupt-based system
     for o in 0..(key_matrix.outputs.len()) {
         let pin_o: &mut Output = &mut key_matrix.outputs[o];
-        // enable pin output
         pin_o.toggle();
-        Timer::after_micros(50).await;
 
-        for i in 0..key_matrix.inputs.len() {
+        // Ensure that the output has time to rise (and previous pin has fallen)
+        Timer::after_nanos(50).await;
+
+        // Scan thru set of inputs for detected key
+        for i in 0..(key_matrix.inputs.len()) {
             let pin_i: &mut Input = &mut key_matrix.inputs[i];
-            // poll input
             if pin_i.is_high() {
-                if let Err(_unpushed) = keys_pressed.push(interpret_coordinate(i, o).unwrap_or(0)) {
-                    // Overflow detected, set phantom case and immediately return
-                    keys_pressed.clear();
-                    for j in 0..keys_pressed.len() {
-                        keys_pressed[j] = 0x01;
+                // Simple debounce - check if the button is still pressed 20ms later
+                Timer::after_millis(DEBOUNCE_TIME as u64).await;
+                if pin_i.is_high() { 
+                    // Overflow keypress detector, sets phantom case and immediately returns
+                    if let Err(_unpushed) = keys_pressed.push(interpret_coordinate(i, o).unwrap_or(0)) {
+                        keys_pressed.clear();
+                        for j in 0..keys_pressed.len() {
+                            keys_pressed[j] = 0x01;
+                        }
+                        return keys_pressed;
                     }
-                    return keys_pressed;
-                }
-            }
-        } 
+                } // debounce pin_i.is_high()
+            } // pin_i.is_high()
+        }  // for i in 0..(key_matrix.inputs.len())
 
-        // disable pin output
+        // Pin fall time is handled by next pin's rise timer
         pin_o.toggle();
-        Timer::after_micros(50).await;
     }
 
     keys_pressed
 }
 
-// Prepare for some disgusting HID stuff. This is the primary keymapping system that takes actual
-// HID codes and remaps them into my custom keymapping. I'm including support for my other
+// Prepare for some disgusting HID stuff. This is the primary keymapping system that takes
+// my custom keymapping and remaps it to HID. I'm including support for my other
 // alternative keys (like Meta and Hyper) alongside the currently implemented shift and layer keys.
 fn keycode_mapping(original_modifier: u16, keycode: u8) -> (u16, u8) {
     // Unmodified
@@ -337,6 +362,7 @@ fn keycode_mapping(original_modifier: u16, keycode: u8) -> (u16, u8) {
     (0,0)
 }
 
+// Interprets the keys as they are on the keymap
 // Add special handling for Layer 1 (0x100), Fn (0x200), Layer 2 (0x100), Meta (0x400), and Hyper (0x800)
 fn interpret_coordinate(input: usize, output: usize) -> Option<u16> {
     match input {
