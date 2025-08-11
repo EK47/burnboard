@@ -6,22 +6,23 @@
 use defmt::*;
 use defmt_rtt as _;
 
-use ch32_hal::{bind_interrupts, peripherals, println};
-use ch32_hal::rcc::HseMode;
-use ch32_hal::usbd::{self, Driver};
+use ch32_hal::{bind_interrupts, peripherals};
+use ch32_hal::usbd::Driver;
+use ch32_hal::gpio::{Level, Output, Input, Pull};
+use ch32_hal::usart::UartTx;
 
-use usbd_hid::descriptor::{KeyboardReport, SerializedDescriptor, KeyboardUsage};
+use usbd_hid::descriptor::{KeyboardReport, SerializedDescriptor};
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
-use embassy_usb::class::hid::{self, HidWriter, RequestHandler};
-use embassy_usb::Builder;
+use embassy_time::Timer;
+use embassy_usb::class::hid::{self, HidWriter};
+use embassy_usb::{Builder, Handler};
 use embassy_futures::join::join;
 
 use heapless::Vec;
+use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use hal::gpio::{Level, Output, Input, Pull};
-use qingke::riscv;
 use {ch32_hal as hal, panic_halt as _};
 
 static DEBOUNCE_TIME: i32 = 20; // 20ms
@@ -34,104 +35,104 @@ bind_interrupts!(struct Irqs {
     USB_LP_CAN1_RX0 => ch32_hal::usbd::InterruptHandler<peripherals::USBD>;
 });
 
+
 #[embassy_executor::main(entry = "qingke_rt::entry")]
 async fn main(spawner: Spawner) -> ! {
     // Initialize and configure settings
+    //ch32_hal::debug::SDIPrint::enable();
     let mut config = hal::Config::default();
 
-    {
-        use hal::rcc::*;
+    /*{
+            use hal::rcc::*;
 
-        // External oscillator is 16 MHz
-        config.rcc.hse = Some(Hse {
-            freq: ch32_hal::time::Hertz(16_000_000),
-            mode: HseMode::Oscillator 
-        });
-
-        config.rcc.pll_src = PllSource::HSE;
-        // Set to 128MHz max
+        config.rcc.hse = None;
+        config.rcc.sys = Sysclk::PLL;
+        config.rcc.pll_src = PllSource::HSI;
+        // Multiply internal 8MHz by 6 to get 48MHz
         config.rcc.pll = Some(Pll {
             prediv: PllPreDiv::DIV1,
-            mul: PllMul::MUL8, 
+            mul: PllMul::MUL6,
+        });
+        config.rcc.pllx = None;
+        config.rcc.ahb_pre = AHBPrescaler::DIV1;
+        config.rcc.apb1_pre = APBPrescaler::DIV1;
+        config.rcc.apb2_pre = APBPrescaler::DIV1;
+        config.rcc.hspll_src = HsPllSource::HSI;
+        config.rcc.hspll = Some(HsPll {
+            pre: HsPllPrescaler::DIV2,
         });
 
-        config.rcc.sys = Sysclk::PLL;
-    }
+        // External oscillator is 16 MHz
+        //config.rcc.hse = Some(Hse {
+        //    freq: ch32_hal::time::Hertz(16_000_000),
+        //    mode: HseMode::Oscillator 
+        //});
+    }*/
 
+    config.rcc = hal::rcc::Config::SYSCLK_FREQ_96MHZ_HSI;
     // p is for peripherals!
-    let p = hal::init(config);
+    let mut p = hal::init(config);
+
+    // This allows pins 13 and 14 to be used as GPIO (standard is SWD)
+    unsafe {
+        // Voltatile read and write
+        let mut values = read_volatile(0x40010004 as *mut u32);
+
+        write_volatile(0x40010004 as *mut u32, values | (0b0100_0000_0000_0000_0000_0000_0000_u32));
+    }
 
     // USB Driver configured to the proper pins.
     let usb_driver = Driver::new(p.USBD, Irqs, p.PA12, p.PA11);
 
     // New config with vendor ID FIAAAAAA and product Id BOA(R)D
-    let mut config = embassy_usb::Config::new(0xF144, 0xB0AD);
-    config.manufacturer = Some("Catchfire");
-    config.product = Some("Burnboard");
-    config.serial_number = Some("0000_0001");
-    config.self_powered = true;
-    config.max_power = 400; //mA
-    config.max_packet_size_0 = 16;
+    //let mut usb_config = embassy_usb::Config::new(0xF144, 0xB0AD);
+    let mut usb_config = embassy_usb::Config::new(0xF144, 0xB0AD);
+    usb_config.manufacturer = Some("Catchfire");
+    usb_config.product = Some("Burnboard");
+    usb_config.serial_number = Some("0000_0001");
+    usb_config.self_powered = true;
+    usb_config.max_power = 200; //mA
+    usb_config.max_packet_size_0 = 64;
 
     // Window compat
-    config.device_class = 0xEF;
-    config.device_sub_class = 0x02;
-    config.device_protocol = 0x01;
-    config.composite_with_iads = true;
+    usb_config.device_class = 0xEF;
+    usb_config.device_sub_class = 0x02;
+    usb_config.device_protocol = 0x01;
+    usb_config.composite_with_iads = true;
 
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
+    let mut msos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
-    let mut request_handler = MyRequestHandler {};
+    let mut device_handler = MyDeviceHandler::new();
 
     let mut state = hid::State::new();
 
     let mut builder = Builder::new(
         usb_driver,
-        config,
+        usb_config,
         &mut config_descriptor,
         &mut bos_descriptor,
-        &mut [],
+        &mut msos_descriptor,
         &mut control_buf,
         );
 
-    let mut config = hid::Config {
+    builder.handler(&mut device_handler);
+    
+    let mut hid_config = hid::Config {
        report_descriptor: KeyboardReport::desc(),
-       request_handler: Some(&mut request_handler),
+       request_handler: None,
        poll_ms: 60,
-       max_packet_size: 8,
+       max_packet_size: 64,
     };
     
-    // maximum 8 byte writer, 6 for keycodes and two for modifier
-    let mut writer = HidWriter::<_, 8>::new(&mut builder, &mut state, config);
+    // maximum 10 byte writer, 6 for keycodes array, 3 for others
+    let mut writer = HidWriter::<_, 10>::new(&mut builder, &mut state, hid_config);
 
     // Starts the USB engine... forever!
     let mut usb = builder.build();
     let usb_fut = usb.run();
-
-    // Currently reports the letter "a" every 500ms
-    /*let hid_fut = async {
-        loop {
-            Timer::after_millis(1000).await;
-
-            let mut report = KeyboardReport::default();
-
-            report.keycodes = [0u8; 6];
-
-            // Letter A 
-            report.keycodes[0] = KeyboardUsage::KeyboardAa as u8;
-
-            match writer.write_serialize(&report).await {
-                Ok(()) => {}
-                Err(e) => warn!("Failed to send report: {:?}", e),
-            }
-        }
-    };
     
-    join(usb_fut, main_fut).await;
-
-    */
-
     // Internally pull-down the Input ports
     let mut row1 = Input::new(p.PB7, Pull::Down);
     let mut row2 = Input::new(p.PB6, Pull::Down);
@@ -146,7 +147,8 @@ async fn main(spawner: Spawner) -> ! {
     let _ = inputs.push(row3);
     let _ = inputs.push(row4);
     let _ = inputs.push(row5);
-    
+   
+
     // Instantiate all twelve columns and all five rows
     let mut col1 = Output::new(p.PA1, Level::Low, Default::default());
     let mut col2 = Output::new(p.PB1, Level::Low, Default::default());
@@ -160,7 +162,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut col10 = Output::new(p.PA13, Level::Low, Default::default());
     let mut col11 = Output::new(p.PA14, Level::Low, Default::default());
     let mut col12 = Output::new(p.PA15, Level::Low, Default::default());
- 
+
     let mut outputs = Vec::<Output<'static>, 12>::new(); 
                                           
     let _ = outputs.push(col1);
@@ -217,44 +219,27 @@ async fn main(spawner: Spawner) -> ! {
                     }
                 }
             }
-            
-            // Ensure each keycode gets its time in the spotlight (aka gets a report)
-            // Individual reports are required due to the layer system and non-standard format.
-            if keycodes.first() != Some(&0x01) {
-                for keycode in keycodes {
-                    let (mut new_modifier, code) = keycode_mapping(modifier, keycode); 
 
-                    // HID doesn't care about layers and all that, so remove before report u8 cast 
-                    new_modifier &= 0b11111111;
+            let mut new_modifier = modifier;
 
-                    // Generate a report with the given keycodes
-                    let report = KeyboardReport {
-                        modifier: new_modifier as u8,
-                        reserved: 0,
-                        leds: 0,
-                        keycodes: [code, 0, 0, 0, 0, 0], 
-                    };
-
-                    // Sends report to computer about the keys being pressed
-                    match writer.write_serialize(&report).await {
-                        Ok(()) => {}
-                        Err(e) => warn!("Failed to send report: {:?}", e),
-                    } 
-                }
-            // Phantom keycode detected, generate phantom report
-            } else {
-                let report = KeyboardReport {
-                    modifier: (modifier & 0b11111111) as u8,
-                    reserved: 0,
-                    leds: 0,
-                    keycodes: [0x01, 0x01, 0x01, 0x01, 0x01, 0x01],
-                };
-
-                match writer.write_serialize(&report).await {
-                    Ok(()) => {}
-                    Err(e) => warn!("Failed to send phantom report: {:?}", e),
-                }
+            // Adjust for my custom keymapping
+            for i in 0..keycodes.len() {
+                (new_modifier, keycodes[i]) = keycode_mapping(modifier, keycodes[i]); 
             }
+
+            // Generate a report with the given keycodes
+            let report = KeyboardReport {
+                modifier: (new_modifier & 0b11111111) as u8,
+                reserved: 0,
+                leds: 0,
+                keycodes: [keycodes[0], keycodes[1], keycodes[2], keycodes[3], keycodes[4], keycodes[5]], 
+            };
+
+            // Sends report to computer about the keys being pressed
+            match writer.write_serialize(&report).await {
+                Ok(()) => {}
+                Err(e) => warn!("Failed to send report: {:?}", e),
+            } 
         } //async loop
     }; //let main_fut
 
@@ -262,7 +247,7 @@ async fn main(spawner: Spawner) -> ! {
 
     loop {
         Timer::after_secs(1).await;
-        info!("WARNING! Impossible point reached implying system failure");
+        warn!("WARNING! Impossible point reached implying major system failure");
     }
 }
 
@@ -278,10 +263,10 @@ async fn scan_matrix(key_matrix: &mut KeyMatrix) -> Vec::<u16, 6> {
     // TODO: Auto-repeat, investigate advanced debounce and interrupt-based system
     for o in 0..(key_matrix.outputs.len()) {
         let pin_o: &mut Output = &mut key_matrix.outputs[o];
-        pin_o.toggle();
+        pin_o.set_high();
 
         // Ensure that the output has time to rise (and previous pin has fallen)
-        Timer::after_nanos(50).await;
+        Timer::after_nanos(20).await;
 
         // Scan thru set of inputs for detected key
         for i in 0..(key_matrix.inputs.len()) {
@@ -291,6 +276,7 @@ async fn scan_matrix(key_matrix: &mut KeyMatrix) -> Vec::<u16, 6> {
                 Timer::after_millis(DEBOUNCE_TIME as u64).await;
                 if pin_i.is_high() { 
                     // Overflow keypress detector, sets phantom case and immediately returns
+                    //println!("i: {}, o: {}", i, o);
                     if let Err(_unpushed) = keys_pressed.push(interpret_coordinate(i, o).unwrap_or(0)) {
                         keys_pressed.clear();
                         for j in 0..keys_pressed.len() {
@@ -303,7 +289,7 @@ async fn scan_matrix(key_matrix: &mut KeyMatrix) -> Vec::<u16, 6> {
         }  // for i in 0..(key_matrix.inputs.len())
 
         // Pin fall time is handled by next pin's rise timer
-        pin_o.toggle();
+        pin_o.set_low();
     }
 
     keys_pressed
@@ -314,7 +300,7 @@ async fn scan_matrix(key_matrix: &mut KeyMatrix) -> Vec::<u16, 6> {
 // alternative keys (like Meta and Hyper) alongside the currently implemented shift and layer keys.
 fn keycode_mapping(original_modifier: u16, keycode: u8) -> (u16, u8) {
     // Unmodified
-    if(original_modifier == 0x000) {
+    if original_modifier == 0x000 {
         match keycode {
             0x2F => return (original_modifier &0b11011111, 0x2F), // Default { instead of [
             _ => return (original_modifier, keycode),
@@ -322,13 +308,13 @@ fn keycode_mapping(original_modifier: u16, keycode: u8) -> (u16, u8) {
     }
     
     // Layer handler
-    if(original_modifier & 0b100000000 == 0b100000000) {
+    if original_modifier & 0b100000000 == 0b100000000 {
         // Check if shift is being held with layer
-        if(original_modifier & 0b0000010 == 0x02 || original_modifier & 0b00100000 == 0x020) {
+        if original_modifier & 0b00000010 == 0x02 || original_modifier & 0b00100000 == 0x020 {
             match keycode {
                 0x29 => return (original_modifier, 0x35), // Shift+Layer+Esc = ~
                 0x2E => return (original_modifier, 0x2D), // Layer+= = -
-                0x2F => return (original_modifier &0b11011101, 0x30), // Shift+Layer+{ = ]
+                0x2F => return (original_modifier & 0b11011101, 0x30), // Shift+Layer+{ = ]
                 0x33 => return (original_modifier, 0x34), // Shift+Layer+; = "
                 0x36 => return (original_modifier, 0x37), // Shift+Layer+, = >
                 0x38 => return (original_modifier, 0x31), // Shift+Layer+/ = |
@@ -338,7 +324,7 @@ fn keycode_mapping(original_modifier: u16, keycode: u8) -> (u16, u8) {
             match keycode {
                 0x29 => return (original_modifier, 0x35), // Layer+Esc = `
                 0x2E => return (original_modifier, 0x2D), // Layer+= = -
-                0x2F => return (original_modifier |0b00100010, 0x30), // Layer+{ = }
+                0x2F => return (original_modifier | 0b00100010, 0x30), // Layer+{ = }
                 0x0B => return (original_modifier, 0x50), // Layer+h = left key 
                 0x0D => return (original_modifier, 0x51), // Layer+j = down key
                 0x0E => return (original_modifier, 0x52), // Layer+k = up key
@@ -352,14 +338,14 @@ fn keycode_mapping(original_modifier: u16, keycode: u8) -> (u16, u8) {
     }
 
     // Shift Key handler
-    if(original_modifier & 0b0000010 == 0x02 || original_modifier & 0b00100000 == 0x020) {
+    if original_modifier & 0b00000010 == 0x02 || original_modifier & 0b00100000 == 0x020 {
         match keycode { 
             0x2F => return (original_modifier &0b11011101, 0x2F), // Shift+{ = [
             _ => return (original_modifier, keycode)
         }
     }
 
-    (0,0)
+    (original_modifier, keycode)
 }
 
 // Interprets the keys as they are on the keymap
@@ -379,7 +365,7 @@ fn interpret_coordinate(input: usize, output: usize) -> Option<u16> {
             9 => Some(0x26), // 9
             10 => Some(0x27), // 0
             11 => Some(0x2E), // =
-            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); return None },
+            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); None },
         }
         1 => match output {
             0 => Some(0x2B), // Tab
@@ -394,7 +380,7 @@ fn interpret_coordinate(input: usize, output: usize) -> Option<u16> {
             9 => Some(0x12), // O
             10 => Some(0x13), // P
             11 => Some(0x2F), // {
-            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); return None },
+            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); None },
         }
         2 => match output {
             0 => Some(0x100), // Layer 1
@@ -409,7 +395,7 @@ fn interpret_coordinate(input: usize, output: usize) -> Option<u16> {
             9 => Some(0x0F), // L
             10 => Some(0x33), // ;
             11 => Some(0x2A), // Backspace
-            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); return None },
+            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); None },
         }
         3 => match output {
             0 => Some(0xE1), // Shift
@@ -424,7 +410,7 @@ fn interpret_coordinate(input: usize, output: usize) -> Option<u16> {
             9 => Some(0x38), // /
             10 => Some(0xE5), // Shift
             11 => Some(0x28), // Enter 
-            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); return None },
+            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); None },
         }
         4 => match output {
             0 => Some(0xE0), // Ctrl
@@ -436,12 +422,12 @@ fn interpret_coordinate(input: usize, output: usize) -> Option<u16> {
             6 => None, // No key
             7 => Some(0x400), // Meta
             8 => Some(0x800), // Hyper
-            9 => Some(0x100), // Layer2
-            10 => Some(0x4C), // Delete
+            9 => Some(0x4C), // Delete
+            10 => Some(0x100), // Layer2
             11 => None, // No Key
-            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); return None },
+            _ => { info!("WARNING - Unexpected output value in interpret_coordinate"); None },
         }
-        _ => { info!("WARNING - Unexpected input value in interpret_coordinate"); return None },
+        _ => { info!("WARNING - Unexpected input value in interpret_coordinate"); None },
     }
 }
 
@@ -450,28 +436,44 @@ struct KeyMatrix {
     outputs: Vec<Output<'static>, 12>
 }
 
+struct MyDeviceHandler {
+    configured: AtomicBool,
+}
 
-// TODO - What the heck is this and do I need to implement more useful behavior?
-struct MyRequestHandler {}
-
-impl RequestHandler for MyRequestHandler {
-    fn get_report(&mut self, id: hid::ReportId, _buf: &mut [u8]) -> Option<usize> {
-        info!("Get report for {:?}", id);
-        None
-    }
-
-    fn set_report(&mut self, id: hid::ReportId, data: &[u8]) -> embassy_usb::control::OutResponse {
-        info!("Set report for {:?}: {=[u8]}", id, data);
-        embassy_usb::control::OutResponse::Accepted
-    }
-
-    fn set_idle_ms(&mut self, id: Option<hid::ReportId>, duration_ms: u32) {
-        info!("Set idle rate for {:?} to {:?}", id, duration_ms);
-    }
-
-    fn get_idle_ms(&mut self, id: Option<hid::ReportId>) -> Option<u32> {
-        info!("Get idle rate for {:?}", id);
-        None
+impl MyDeviceHandler {
+    fn new() -> Self {
+        MyDeviceHandler {
+            configured: AtomicBool::new(false),
+        }
     }
 }
 
+impl Handler for MyDeviceHandler {
+    fn enabled(&mut self, enabled: bool) {
+        self.configured.store(false, Ordering::Relaxed);
+        if enabled {
+            info!("Device enabled");
+        } else {
+            info!("Device disabled");
+        }
+    }
+
+    fn reset(&mut self) {
+        self.configured.store(false, Ordering::Relaxed);
+        info!("Bus reset, the Vbus current limit is 100mA");
+    }
+
+    fn addressed(&mut self, addr: u8) {
+        self.configured.store(false, Ordering::Relaxed);
+        info!("Usb address set to: {}", addr);
+    }
+
+    fn configured(&mut self, configured: bool) {
+        self.configured.store(configured, Ordering::Relaxed);
+        if configured {
+            info!("Device configured, it may draw up to the configured current limit");
+        } else {
+            info!("Device no longer configured, Vbus current limit is 100mA");
+        }
+    }
+}
